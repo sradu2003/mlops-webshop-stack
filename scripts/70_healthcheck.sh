@@ -6,10 +6,35 @@
 #   bash scripts/70_healthcheck.sh
 #
 # Exit code 0 = everything healthy, 1 = at least one check failed.
+#
+# PLATFORM NOTE
+# -------------
+# This script is written for the Ubuntu 22.04 VPS, which is where it is
+# authoritative. On macOS the systemd, TLS, ufw and backup checks cannot
+# pass by construction — the services are not managed by systemd there.
+# Run it on macOS to check the container tier, and on the VPS for the
+# whole stack. A `Linux-only` marker is printed next to each check that
+# cannot apply off the VPS.
 # =============================================================================
 set -uo pipefail
 
+IS_LINUX=false
+if [[ "$(uname -s)" == "Linux" ]]; then
+  IS_LINUX=true
+fi
+
 REPO_DIR="${REPO_DIR:-/opt/mlops-webshop-stack}"
+# The compose project may have been started from a different checkout than
+# the one this script lives in. Resolve the compose file from the RUNNING
+# containers rather than assuming REPO_DIR, otherwise every container check
+# reports "not running" on a machine where the stack is perfectly healthy.
+COMPOSE_FILE=""
+for cand in "$REPO_DIR/docker/docker-compose.yml" "./docker/docker-compose.yml"; do
+  if [[ -f "$cand" ]]; then
+    COMPOSE_FILE="$(cd "$(dirname "$cand")" && pwd)/docker-compose.yml"
+    break
+  fi
+done
 PASS=0
 FAIL=0
 WARN=0
@@ -53,13 +78,17 @@ echo "=============================================================="
 # --- 1. Systemd services ---------------------------------------------------
 echo
 echo "[systemd services]"
-for unit in python-api streamlit-app node-api nextjs-rag jupyterlab nginx apache2 postgresql mariadb; do
-  if systemctl is-active --quiet "$unit" 2>/dev/null; then
-    ok "$unit is active"
-  else
-    bad "$unit is NOT active"
-  fi
-done
+if [[ "$IS_LINUX" != "true" ]]; then
+  warn "systemd checks skipped — this is not Linux (run the health check on the VPS)"
+else
+  for unit in python-api streamlit-app node-api nextjs-rag jupyterlab nginx apache2 postgresql mariadb; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      ok "$unit is active"
+    else
+      bad "$unit is NOT active"
+    fi
+  done
+fi
 
 # --- 2. Host application ports --------------------------------------------
 echo
@@ -87,7 +116,15 @@ http_check "streamlit health"    "http://127.0.0.1:3001/_stcore/health"
 echo
 echo "[docker services]"
 if command -v docker >/dev/null; then
-  cd "$REPO_DIR/docker" 2>/dev/null || cd .
+  # `docker compose` needs the project directory: the env file
+  # (docker/.env) and the relative volume paths live next to the compose
+  # file. Run every compose call from that directory.
+  COMPOSE_DIR="$(dirname "${COMPOSE_FILE:-$REPO_DIR/docker/docker-compose.yml}")"
+  if [[ ! -d "$COMPOSE_DIR" ]]; then
+    warn "compose directory not found: $COMPOSE_DIR — skipping container checks"
+    COMPOSE_DIR=""
+  fi
+  cd "$COMPOSE_DIR" 2>/dev/null || true
   for svc in ollama open-webui listmonk listmonk-db prometheus grafana node-exporter; do
     state="$(docker compose ps --format '{{.Service}} {{.State}} {{.Health}}' \
       2>/dev/null | awk -v s="$svc" '$1==s {print $2, $3}')"
@@ -107,6 +144,19 @@ if command -v docker >/dev/null; then
     ok "listmonk-init completed successfully (schema installed)"
   else
     bad "listmonk-init did not complete cleanly — listmonk will crash-loop: $init_state"
+  fi
+
+  # Diagnose the most common container failure: the Postgres volume was
+  # initialised with an older password, so the initdb scripts never re-ran
+  # and every client that authenticates fails. The raw log line is
+  # cryptic, so translate it into the actual remedy.
+  db_state="$(docker compose ps --format '{{.Service}} {{.State}}' 2>/dev/null \
+    | awk '$1=="listmonk-db" {print $2}')"
+  if [[ "$db_state" == "running" ]]; then
+    if docker compose logs --tail=200 open-webui 2>/dev/null \
+         | grep -q "password authentication failed for user"; then
+      bad "open-webui cannot authenticate to listmonk-db — the Postgres volume holds an OLD password (initdb only runs on an empty volume). Fix:  docker exec listmonk-db psql -U ${LISTMONK_DB_USER:-shop} -d ${LISTMONK_DB_NAME:-shopdb} -c \"ALTER ROLE ${LISTMONK_DB_USER:-shop} WITH PASSWORD '<new>';\""
+    fi
   fi
 
   http_check "ollama /api/tags"       "http://127.0.0.1:${OLLAMA_HOST_PORT:-11434}/api/tags"
@@ -158,7 +208,9 @@ fi
 # --- 6. TLS ----------------------------------------------------------------
 echo
 echo "[tls]"
-if [[ -f /etc/ssl/shared/fullchain.pem ]]; then
+if [[ "$IS_LINUX" != "true" ]]; then
+  warn "TLS checks skipped — not Linux (the cert lives in /etc/ssl/shared on the VPS)"
+elif [[ -f /etc/ssl/shared/fullchain.pem ]]; then
   if openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt /etc/ssl/shared/fullchain.pem >/dev/null 2>&1; then
     ok "certificate at /etc/ssl/shared/fullchain.pem is trusted"
   else
@@ -180,7 +232,9 @@ fi
 # --- 7. Security checks ----------------------------------------------------
 echo
 echo "[security]"
-if [[ -f /opt/jupyter/.env ]] && grep -qE "JUPYTER_TOKEN=.+" /opt/jupyter/.env; then
+if [[ "$IS_LINUX" != "true" ]]; then
+  warn "Jupyter token check skipped — not Linux (/opt/jupyter/.env is a VPS artifact)"
+elif [[ -f /opt/jupyter/.env ]] && grep -qE "JUPYTER_TOKEN=.+" /opt/jupyter/.env; then
   ok "JupyterLab has an access token set"
 else
   bad "JupyterLab has NO access token — it is an unauthenticated RCE hole"
@@ -192,7 +246,9 @@ else
   ok "no management port is bound to 0.0.0.0"
 fi
 
-if ufw status 2>/dev/null | grep -q "Status: active"; then
+if [[ "$IS_LINUX" != "true" ]]; then
+  warn "ufw check skipped — not Linux"
+elif ufw status 2>/dev/null | grep -q "Status: active"; then
   ok "ufw is active"
 else
   warn "ufw is not active (or not installed)"
@@ -201,11 +257,15 @@ fi
 # --- 8. Backup freshness ----------------------------------------------------
 echo
 echo "[backups]"
-latest="$(find /var/backups/mlops-webshop -type f -name '*.gz' -mtime -2 2>/dev/null | head -1)"
-if [[ -n "$latest" ]]; then
-  ok "a backup exists from the last 2 days"
+if [[ "$IS_LINUX" != "true" ]]; then
+  warn "backup freshness check skipped — not Linux (/var/backups is a VPS path)"
 else
-  bad "no recent backup found in /var/backups/mlops-webshop"
+  latest="$(find /var/backups/mlops-webshop -type f -name '*.gz' -mtime -2 2>/dev/null | head -1)"
+  if [[ -n "$latest" ]]; then
+    ok "a backup exists from the last 2 days"
+  else
+    bad "no recent backup found in /var/backups/mlops-webshop"
+  fi
 fi
 
 # --- Summary ----------------------------------------------------------------

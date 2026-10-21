@@ -301,6 +301,40 @@ bash scripts/70_healthcheck.sh
 - **Apple Silicon images.** All images used have arm64 builds. `node-exporter`
   needs `pid: host` to see host metrics.
 
+### The `initdb` trap
+
+The `docker/initdb/` scripts run **only when the Postgres data directory is
+empty**. Change `LISTMONK_DB_PASSWORD` (or any `POSTGRES_*` value) in
+`docker/.env` *after* the first start and the change is silently ignored —
+the volume still holds the old password. The symptom is a crash-looping
+`open-webui` with:
+
+```
+FATAL: password authentication failed for user "shop"
+```
+
+Three ways to deal with it, in order of preference:
+
+```bash
+# 1. Update the role in place — keeps the data
+docker exec listmonk-db psql -U shop -d shopdb \
+  -c "ALTER ROLE shop WITH PASSWORD '<the new password>';"
+docker compose -f docker-compose.yml -f docker-compose.dev.yml restart open-webui
+
+# 2. Re-create the volume — loses the data, re-runs initdb
+cd docker
+docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+# 3. Create the missing database by hand (if initdb never ran)
+docker exec listmonk-db psql -U shop -d shopdb \
+  -c 'CREATE DATABASE openwebui OWNER shop;'
+```
+
+> The same applies to `listmonk`: it crash-loops without the `listmonk-init`
+> one-shot container having completed. Check
+> `docker compose ps listmonk-init` — it must show `Exited (0)`.
+
 ### Running the APIs locally (optional)
 
 ```bash
@@ -572,6 +606,16 @@ states, the `listmonk-init` exit code, Prometheus target health, the TLS
 certificate chain and expiry, the Jupyter auth token, public-interface
 exposure, ufw, and backup freshness.
 Exit code `0` = healthy.
+
+> **Run it on the VPS.** The systemd, TLS, ufw, Jupyter-token and backup
+> checks are Linux-only — on macOS they are reported as *skipped*, not as
+> failures, so a developer can still use the script to check the container
+> tier. A Prometheus target that is down also reports the **scrape error**,
+> so you can tell "the service is dead" apart from "the scrape path in
+> `prometheus.yml` points at the wrong URL".
+>
+> A crash-looping `open-webui` with `password authentication failed` is
+> reported with the exact remedy — see [The `initdb` trap](#the-initdb-trap).
 
 ### Test suite
 

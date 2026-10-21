@@ -410,6 +410,7 @@ are removed while `.env` and `.venv` are preserved. Your existing app
 |---|---|---|
 | `python-api` will not start | `JWT_SECRET` / `ANON_SALT` still a placeholder | Set them in `/opt/mlops-webshop-stack/.env`, re-run `30_install_apps.sh` |
 | `listmonk` restart-looping | Schema not installed | `docker compose up -d listmonk-init` and check it exits 0 |
+| `open-webui` crash-looping with "password authentication failed" | The Postgres volume was initialised with an older password — `initdb` scripts only run on an empty volume | `docker exec listmonk-db psql -U shop -d shopdb -c "ALTER ROLE shop WITH PASSWORD '<new>';"`, then restart. See "The initdb trap" in the README |
 | Prometheus target `nextjs_rag` is down | Wrong metrics path | Should be `/api/metrics` — check `monitoring/prometheus/prometheus.yml` |
 | Prometheus targets `down` for host services | `host.docker.internal` not mapped | The compose file sets `extra_hosts: host-gateway`; confirm with `docker compose config` |
 | Prometheus target `node_exporter` down with "not a shared or slave mount" | The base compose uses `rslave`, which Docker Desktop rejects | On macOS start with the dev override: `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d` |
