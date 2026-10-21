@@ -42,7 +42,11 @@ export default async function handler(req, res) {
 
   const url = process.env.OLLAMA_URL || "http://127.0.0.1:11434";
   const model = process.env.OLLAMA_MODEL || "qwen2.5:0.5b";
-  const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS || 120000);
+  // 300 s by default. A 0.5B model on CPU-only hardware needs 2-4 minutes
+  // for a short answer, and the previous 120 s default timed out on
+  // answers that were about to succeed. The timeout is a ceiling, not a
+  // delay: a fast machine still returns immediately.
+  const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS || 300000);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

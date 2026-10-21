@@ -21,15 +21,16 @@ monetised.
 5. [Prerequisites](#5-prerequisites)
 6. [Local development (macOS M3 Max)](#6-local-development-macos-m3-max)
 7. [Production deployment (Ubuntu 22.04 VPS)](#7-production-deployment-ubuntu-2204-vps)
-8. [Configuration](#8-configuration)
-9. [Operating the stack](#9-operating-the-stack)
-10. [Validation & testing](#10-validation--testing)
-11. [Monitoring](#11-monitoring)
-12. [Backup & restore](#12-backup--restore)
-13. [Security model](#13-security-model)
-14. [Cloud deployment (AWS / GCP)](#14-cloud-deployment-aws--gcp)
-15. [Known limitations](#15-known-limitations)
-16. [Roadmap](#16-roadmap)
+8. [Step-by-step usage guide](#8-step-by-step-usage-guide)
+9. [Configuration](#9-configuration)
+10. [Operating the stack](#10-operating-the-stack)
+11. [Validation & testing](#11-validation--testing)
+12. [Monitoring](#12-monitoring)
+13. [Backup & restore](#13-backup--restore)
+14. [Security model](#14-security-model)
+15. [Cloud deployment (AWS / GCP)](#15-cloud-deployment-aws--gcp)
+16. [Known limitations](#16-known-limitations)
+17. [Roadmap](#17-roadmap)
 
 ---
 
@@ -459,7 +460,522 @@ curl -s https://api.example.com/api/usage/summary?since_hours=24 | python3 -m js
 
 ---
 
-## 8. Configuration
+## 8. Step-by-step usage guide
+
+This section walks through using the platform once it is running. Every
+command is a real `curl` against a real endpoint; the responses shown are
+the actual shapes returned by the code.
+
+Throughout, `API` is the base URL of the platform API. On the VPS that
+is `https://api.xxx.com`; locally it is `http://127.0.0.1:3000`.
+
+```bash
+export API="https://api.xxx.com"      # or http://127.0.0.1:3000 locally
+```
+
+### Step 1 — Register the first account
+
+The **first** account created on a fresh deployment is automatically
+promoted to `owner`, so this is how you bootstrap the platform. Do it
+before anyone else registers.
+
+```bash
+curl -s -X POST "$API/api/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "email": "you@example.com",
+        "password": "Str0ngPassw0rd2026",
+        "display_name": "You"
+      }' | python3 -m json.tool
+```
+
+```json
+{
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "token_type": "bearer",
+    "expires_in": 43200
+}
+```
+
+The password must be **at least 8 characters and contain both a letter
+and a digit**. A password that fails the policy is rejected with a
+`422` and a field-level explanation — it is never silently accepted and
+never silently weakened.
+
+Every later registration gets the role `user` and **cannot** create
+content. Roles are `user` → `author` → `curator` → `admin` → `owner`, and
+there is no role-assignment API: it is a deliberate database-level
+operation, so a normal account can never grant itself permissions.
+
+```bash
+# Promote an account to author (the platform owner does this).
+# Postgres runs in the compose stack, so use `docker exec`.
+docker exec listmonk-db psql -U shop -d shopdb -c \
+  "UPDATE users SET role = 'author' WHERE email = 'someone@example.com';"
+
+# Verify
+docker exec listmonk-db psql -U shop -d shopdb -c \
+  "SELECT id, email, role FROM users ORDER BY id;"
+```
+
+The account is usable immediately — the role is read from the database
+on every request, so no restart or re-login is needed. The `role`
+column is a PostgreSQL enum (`user_role`), so the value must be exactly
+one of `anonymous`, `user`, `author`, `curator`, `admin`, `owner`.
+
+### Step 2 — Keep the token handy
+
+```bash
+export TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+Get one later with a login:
+
+```bash
+export TOKEN=$(curl -s -X POST "$API/api/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"Str0ngPassw0rd2026"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+```
+
+Check who you are, and confirm the access token is still valid:
+
+```bash
+curl -s "$API/api/auth/me" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+```json
+{
+    "id": 1,
+    "email": "you@example.com",
+    "display_name": "You",
+    "role": "owner",
+    "is_active": true,
+    "email_verified": false,
+    "revenue_share_pct": 70.0,
+    "created_at": "2026-10-21T07:15:22.104Z"
+}
+```
+
+`revenue_share_pct` is this account's default cut of the net revenue
+from content it authors (70% by default). A co-author's cut is set per
+content item — see [Step 5](#step-5--invite-a-co-author).
+
+When the access token expires (default 12 hours), exchange the refresh
+token for a new pair (the refresh token is valid for 30 days):
+
+```bash
+curl -s -X POST "$API/api/auth/refresh?token=$REFRESH_TOKEN" | python3 -m json.tool
+```
+
+### Step 3 — Create a content item
+
+Only `author`, `curator`, `admin` and `owner` may create content.
+
+```bash
+curl -s -X POST "$API/api/content" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "title": "Intro to MLOps",
+        "slug": "intro-to-mlops",
+        "summary": "A hands-on introduction to the MLOps lifecycle.",
+        "content_type": "tutorial",
+        "price_cents": 4900,
+        "currency": "EUR",
+        "tags": ["mlops", "beginner"]
+      }' | python3 -m json.tool
+```
+
+```json
+{
+    "id": 1,
+    "uuid": "839b437e-2629-45df-a0f3-e84cfe02f040",
+    "title": "Intro to MLOps",
+    "slug": "intro-to-mlops",
+    "status": "draft",
+    "author_id": 1,
+    "price_cents": 4900,
+    "currency": "EUR",
+    "is_listed": false,
+    "published_at": null,
+    "duration_seconds": 0,
+    "tags": ["mlops", "beginner"]
+}
+```
+
+Note the field rules the API enforces:
+
+| Field | Rule |
+|---|---|
+| `title` | 3–300 characters |
+| `slug` | Lowercase letters, digits and dashes — must be unique |
+| `price_cents` | An **integer in cents**, `0`–`100_000_000`. Never a float |
+| `currency` | Exactly 3 characters, upper-cased for you |
+| `tags` | At most 20 |
+| `content_type` | `tutorial` (default), `course`, `video` — free-form string |
+
+A new item starts as `draft`. **A draft is invisible to the public** —
+`GET /api/content/{id}` returns 404 to anyone who is not the author, an
+accepted co-author, a curator or an admin.
+
+### Step 4 — Publish it
+
+```bash
+curl -s -X PATCH "$API/api/content/1" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"status": "published", "is_listed": true}' | python3 -m json.tool
+```
+
+Now it is publicly listable:
+
+```bash
+curl -s "$API/api/content" | python3 -m json.tool
+curl -s "$API/api/content/slug/intro-to-mlops" | python3 -m json.tool
+```
+
+### Step 5 — Invite a co-author
+
+Co-authoring is the core of the platform. Add a contributor to your
+content item:
+
+```bash
+# The contributor's numeric user id
+curl -s "$API/api/auth/me" -H "Authorization: Bearer $COAUTHOR_TOKEN" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+
+curl -s -X POST "$API/api/content/1/contributions" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"contributor_id": 2, "role": "co_author"}' | python3 -m json.tool
+```
+
+```json
+{
+    "id": 1,
+    "content_id": 1,
+    "contributor_id": 2,
+    "role": "co_author",
+    "revenue_share_pct": 10.0,
+    "is_accepted": true,
+    "created_at": "2026-10-21T10:13:27.404595Z"
+}
+```
+
+An **accepted** co-author can now edit the content and attach assets to
+it. Only the content owner (or an admin/owner) can add or remove
+contributors.
+
+`revenue_share_pct` is the co-author's cut of the net revenue from
+this content item — it defaults to 10%, while the content owner keeps
+70% (the `users.revenue_share_pct` default). Both are per-item
+overrides, so a co-author can be paid differently on different items.
+
+### Step 6 — Attach media (multi-modal assets)
+
+Binary media is **not** stored in Postgres. The bytes live in an
+S3-compatible object store; the API only holds the metadata row that
+points at them. The flow is: upload the bytes directly to the object
+store with a presigned URL, then register the metadata here.
+
+```bash
+curl -s -X POST "$API/api/assets" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "content_id": 1,
+        "filename": "lesson-01-intro.mp4",
+        "kind": "video",
+        "mime_type": "video/mp4",
+        "size_bytes": 104857600
+      }' | python3 -m json.tool
+```
+
+The asset starts in status `uploading`. When the transcoder finishes,
+mark it ready:
+
+```bash
+curl -s -X POST "$API/api/assets/1/complete" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+> The object-store client is **not** implemented yet — see
+> [Known limitations](#16-known-limitations). The API side of the flow
+> is ready; you need to supply the presigned upload.
+
+### Step 7 — Record usage telemetry
+
+This is the heart of the monetisation story: the platform tracks how
+**both anonymous visitors and registered members** use the material.
+
+**Anonymous** — no token, no account, no cookies required:
+
+```bash
+curl -s -X POST "$API/api/usage/events" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "event_type": "play",
+        "content_id": 1,
+        "watch_seconds": 240,
+        "completion_ratio": 0.42,
+        "referrer": "https://news.ycombinator.com/",
+        "device": "desktop"
+      }' | python3 -m json.tool
+```
+
+**Registered** — the same endpoint, with a token, and the event is
+attributed to the account:
+
+```bash
+curl -s -X POST "$API/api/usage/events" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"event_type": "completion", "content_id": 1, "completion_ratio": 1.0}'
+```
+
+The valid `event_type` values are:
+
+| Event | Meaning |
+|---|---|
+| `page_view` | A landing page was viewed |
+| `asset_impression` | A video/image was shown in a listing |
+| `play` | Playback started |
+| `watch_progress` | A progress ping during playback |
+| `completion` | The asset was watched to the end |
+| `download` | The asset was downloaded |
+| `search` | A search was performed |
+| `chat_message` | A chat message was sent (e.g. to the RAG assistant) |
+| `share` | The content was shared |
+| `purchase` | A purchase was completed — the conversion event |
+
+`completion_ratio` must be between `0.0` and `1.0`, and `watch_seconds`
+must not be negative — anything outside those bounds is rejected with
+`422` before the event is stored. An `event_type` outside the table
+above is rejected with `422` and an `Unknown event_type '...'` detail.
+
+> An **invalid or expired bearer token does not fail the request** — the
+> event is still recorded, as anonymous. Telemetry must never break a
+> page load because a token went stale. The event simply carries no
+> `user_id`, so it counts towards the anonymous half of the funnel
+> rather than being attributed to an account.
+
+**Read the aggregate funnel** — public, and it exposes no identities:
+
+```bash
+curl -s "$API/api/usage/summary?since_hours=24" | python3 -m json.tool
+```
+
+```json
+{
+    "window_hours": 24,
+    "since": "2026-10-20T10:13:34.970754+00:00",
+    "total_events": 3,
+    "watch_seconds": 240,
+    "avg_completion_ratio": 0.8067,
+    "unique_registered_viewers": 1,
+    "unique_anonymous_viewers": 1,
+    "events_by_type": {
+        "play": 1,
+        "page_view": 1,
+        "completion": 1
+    },
+    "top_content": [
+        {
+            "content_id": 1,
+            "title": "Intro to MLOps",
+            "events": 3,
+            "watch_seconds": 240
+        }
+    ]
+}
+```
+
+The window is `since_hours` (1 to 2160). This is what the Streamlit
+dashboard reads, and what a pricing decision should be based on.
+
+The two `unique_*_viewers` counters are the monetisation signal: they
+compare how many **registered** members used the material against how
+many **anonymous** visitors did. A large anonymous-to-registered gap is
+the conversion funnel the platform exists to measure.
+
+**Read the raw event stream** — this carries `user_id`, so it tells you
+*who* watched *what*. It requires the `curator`, `admin` or `owner`
+role:
+
+```bash
+curl -s "$API/api/usage/events?page=1&page_size=50" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+### Step 8 — Ask the RAG assistant
+
+The Next.js RAG service proxies to Ollama. On a CPU-only VPS a 0.5B
+model takes **2–4 minutes** for the first answer (and a while for each
+one after — the model is reloaded on every request unless
+`OLLAMA_KEEP_ALIVE` holds it resident), so the client timeout must be
+generous:
+
+```bash
+export RAG="https://rag.xxx.com"      # or http://127.0.0.1:8001 locally
+
+curl -s --max-time 320 -X POST "$RAG/api/ask" \
+  -H 'Content-Type: application/json' \
+  -d '{"q": "What does the intro-to-mlops course cover?"}' | python3 -m json.tool
+```
+
+```json
+{
+    "answer": "The course covers the MLOps lifecycle: data preparation, ...",
+    "model": "qwen2.5:0.5b"
+}
+```
+
+The field is `q`, not `question`:
+
+| Condition | Response |
+|---|---|
+| `q` missing or blank | `422` — `{"error": "field 'q' is required"}` |
+| Body is not valid JSON | `400` — `{"error": "invalid JSON body"}` |
+| Ollama is unreachable or errors | `502` — `{"error": "ollama upstream error (503)"}` |
+| Ollama did not answer in time | `502` — `{"error": "ollama request timed out"}` |
+
+The upstream timeout is `OLLAMA_TIMEOUT_MS`, **300 s by default**. It is
+a ceiling, not a delay — a GPU-backed machine still answers in seconds.
+If you see `ollama request timed out` on a CPU-only VPS, that is the
+expected behaviour, not a bug: either wait longer, add a GPU, or route
+inference to a hosted API.
+
+### Step 9 — Look at the internal dashboard
+
+The Streamlit app reads the public usage summary and the published
+catalogue. It needs no credential:
+
+```bash
+export API_BASE="http://127.0.0.1:3000"    # the API it should query
+streamlit run apps/streamlit-app/app.py
+# → http://127.0.0.1:8501
+```
+
+It calls exactly two endpoints — `GET /api/usage/summary?since_hours=N`
+and `GET /api/content?page_size=200` — both of which are public, which
+is why the dashboard needs no token.
+
+### Step 10 — Watch the metrics
+
+Every service exposes Prometheus metrics. Scrape them directly:
+
+```bash
+curl -s http://127.0.0.1:3000/metrics | head -20    # FastAPI
+curl -s http://127.0.0.1:8000/metrics | head -20    # Node API
+curl -s http://127.0.0.1:8001/api/metrics | head -20 # Next.js RAG
+```
+
+> The RAG service is scraped at **`/api/metrics`**, not `/metrics`.
+
+Then query the pre-computed recording rules:
+
+```bash
+# Request rate per service
+curl -s -G http://127.0.0.1:9091/api/v1/query \
+  --data-urlencode 'query=service:http_requests:rate5m' | python3 -m json.tool
+
+# 5xx ratio per service
+curl -s -G http://127.0.0.1:9091/api/v1/query \
+  --data-urlencode 'query=service:http_error_ratio:rate5m' | python3 -m json.tool
+
+# p95 latency per service
+curl -s -G http://127.0.0.1:9091/api/v1/query \
+  --data-urlencode 'query=service:http_request_duration_seconds:p95' | python3 -m json.tool
+
+# LLM call latency and error rate
+curl -s -G http://127.0.0.1:9091/api/v1/query \
+  --data-urlencode 'query=llm:upstream_request_duration_seconds:p95' | python3 -m json.tool
+```
+
+### Step 11 — Back up, and prove the backup works
+
+```bash
+sudo bash scripts/60_backup.sh                          # take one now
+sudo bash scripts/65_restore.sh /var/backups/mlops-webshop   # and prove it restores
+```
+
+The restore script **verifies every archive before it touches
+anything**, and it refuses to run on a corrupt backup. It also prompts
+for confirmation, because it overwrites live data.
+
+### Quick reference — the whole flow in one block
+
+> This block registers a **new** account, so it only works while that
+> account is the first one on the database (which makes it `owner`). On
+> an already-populated database, sign in as an existing `author` or
+> `owner` instead — see [Step 2](#step-2--keep-the-token-handy).
+
+```bash
+export API="https://api.xxx.com"
+
+# 1. Register (first account becomes owner) and keep the token
+export TOKEN=$(curl -s -X POST "$API/api/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"Str0ngPassw0rd2026","display_name":"You"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+
+# 2. Create a draft
+ID=$(curl -s -X POST "$API/api/content" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"Intro to MLOps","slug":"intro-to-mlops","price_cents":4900}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# 3. Publish it
+curl -s -X PATCH "$API/api/content/$ID" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"status":"published","is_listed":true}' >/dev/null
+
+# 4. Record an anonymous view
+curl -s -X POST "$API/api/usage/events" -H 'Content-Type: application/json' \
+  -d "{\"event_type\":\"page_view\",\"content_id\":$ID}" >/dev/null
+
+# 5. Read the funnel
+curl -s "$API/api/usage/summary?since_hours=24" | python3 -m json.tool
+```
+
+If step 2 returns `403 {"detail":"Requires one of: admin, author, curator, owner"}`,
+the account is not a writer. That is the role gate doing its job —
+promote the account, or use one that is already an author.
+
+### Endpoint quick reference
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/api/auth/register` | None | Create an account; the first one becomes `owner` |
+| `POST` | `/api/auth/login` | None | Exchange credentials for tokens |
+| `POST` | `/api/auth/refresh?token=` | None | New token pair from a refresh token |
+| `GET` | `/api/auth/me` | Bearer | The current user |
+| `GET` | `/api/content` | None | Public catalogue — published items only |
+| `GET` | `/api/content/{id}` | Optional | One item; drafts 404 for the public |
+| `GET` | `/api/content/slug/{slug}` | Optional | One item, by slug |
+| `POST` | `/api/content` | Author+ | Create a draft |
+| `PATCH` | `/api/content/{id}` | Owner/co-author | Edit, and publish |
+| `DELETE` | `/api/content/{id}` | Owner | Delete |
+| `GET` | `/api/content/{id}/contributions` | None | List contributors |
+| `POST` | `/api/content/{id}/contributions` | Owner | Add a co-author |
+| `DELETE` | `/api/content/{id}/contributions/{cid}` | Owner | Remove a co-author |
+| `POST` | `/api/content/{id}/revisions` | Owner/co-author | Snapshot a revision |
+| `GET` | `/api/assets` | None | List asset metadata |
+| `GET` | `/api/assets/{id}` | None | One asset |
+| `POST` | `/api/assets` | Authenticated **and** must be able to edit the target content | Register an uploaded asset |
+| `POST` | `/api/assets/{id}/complete` | Uploader, admin or owner | Mark an asset ready |
+| `DELETE` | `/api/assets/{id}` | Uploader/admin | Delete an asset |
+| `POST` | `/api/usage/events` | None (optional) | Record a usage event |
+| `GET` | `/api/usage/events` | curator/admin/owner | The raw event stream (carries `user_id`) |
+| `GET` | `/api/usage/summary` | None | The aggregate funnel |
+| `GET` | `/health`, `/ready` | None | Liveness and readiness |
+| `GET` | `/metrics` | None (loopback only) | Prometheus metrics |
+
+---
+
+## 9. Configuration
 
 ### Configuration hierarchy
 
@@ -524,7 +1040,7 @@ by convention.
 
 ---
 
-## 9. Operating the stack
+## 10. Operating the stack
 
 ### Service control
 
@@ -566,7 +1082,7 @@ sudo systemctl daemon-reload && sudo systemctl restart python-api
 
 ---
 
-## 10. Validation & testing
+## 11. Validation & testing
 
 ### Local validation (pre-push)
 
@@ -623,7 +1139,7 @@ Two suites, separated by marker so the default run never needs a database.
 
 ```bash
 cd apps/python-api
-source .venv/bin/activate
+source .venv/bin/activate          # or any venv with the deps installed
 export JWT_SECRET=$(openssl rand -hex 32)
 export ANON_SALT=$(openssl rand -hex 32)
 
@@ -634,6 +1150,14 @@ pytest -q tests/ -m integration # 45 integration tests — needs Postgres
 The default marker filter is `not integration`, so `pytest -q tests/` is
 safe on a machine with no Postgres running. The integration suite is
 opt-in.
+
+> **The venv is a hard requirement.** The tests import the application
+> package (`from app.config import Settings`), so `fastapi`,
+> `sqlalchemy`, `psycopg` and `pydantic` must be installed. `pytest.ini`
+> sets `pythonpath = .` so the `app` package resolves from
+> `apps/python-api/` without an editable install — but the third-party
+> dependencies still have to be present. Full setup is in
+> [Running the suites](#running-the-suites).
 
 ### Integration tests (need Postgres)
 
@@ -659,6 +1183,223 @@ pytest -q tests/ -m integration
 > The suite **drops and recreates the schema for every test**, so point
 > `DATABASE_URL` at a throwaway database. Never at production.
 
+### Reading the pytest results
+
+A pytest run tells you three different things. Here is how to read each.
+
+**1. The one-line summary — is the suite green?**
+
+```
+================= 40 passed, 45 deselected, 1 warning in 1.43s =================
+```
+
+| Token | Meaning |
+|---|---|
+| `40 passed` | The number of tests that succeeded |
+| `45 deselected` | Tests skipped by the **marker filter** (`-m "not integration"` in `pytest.ini`) — not failures |
+| `1 warning` | Non-fatal notices. `DeprecationWarning` from a third-party library is expected |
+| `in 1.43s` | Wall-clock duration |
+
+`deselected` is the key to read correctly. A count there means the
+integration suite was **not run**, not that it failed. If you expected
+the integration tests to run and see `deselected`, your `-m` flag or
+`pytest.ini` filter is wrong.
+
+**2. The progress dots — where did it get to?**
+
+```
+tests/test_config.py .......                                             [ 17%]
+tests/test_schemas.py ..................                                 [ 62%]
+tests/test_security.py ...............                                   [100%]
+```
+
+Each character is one test: `.` passed, `F` failed, `E` errored (the
+test blew up before it could assert), `s` skipped, `x` xfailed,
+`X` xpassed. The percentage is the progress through the run, so a run
+that stops at 62% with an `E` died there.
+
+**3. The failure detail — what actually broke.**
+
+A failure prints the assertion, the two values, and the source line. Read
+it top-down: the assertion is what was expected, the `E` block is what
+happened.
+
+```
+_____________________________ TestAuth.test_login_succeeds ______________________________
+
+    def test_login_succeeds(self, client):
+        resp = client.post("/api/auth/login", json={...})
+>       assert resp.status_code == 200
+E       assert 401 == 200
+E        +  where 401 = <Response [401 Unauthorized]>.status_code
+
+tests/integration/test_api.py:173: AssertionError
+------------------------------ Captured log call -------------------------------
+ERROR    shop-api:main.py:103 unhandled error request_id=... path=/api/auth/login
+```
+
+The `E` lines are pytest's **diff**: the first is `expected == actual`,
+and the `+  where ...` line unpacks the right-hand side so you can see
+the actual response. The last line is the file and line number of the
+failing assertion.
+
+The **Captured log call** block below the assertion is the
+application's own log output for that request. When a test fails
+mysteriously, that block usually has the answer — a 500 here means the
+API hit an exception, not that the assertion was wrong.
+
+To see the full request/response body behind a failing HTTP assertion,
+add `--tb=long`, or run that single test with `-l`:
+
+```bash
+pytest tests/integration/test_api.py::TestAuth::test_login_succeeds -m integration -l
+```
+
+**Useful flags:**
+
+| Flag | What it does |
+|---|---|
+| `-v` | One line per test, with its name — the fastest way to see *which* test failed |
+| `-q` | Quiet: dots only. The default in `pytest.ini` |
+| `-x` | Stop at the **first** failure — quicker feedback while fixing a broken thing |
+| `--lf` | Re-run only the tests that failed last time |
+| `--ff` | Re-run the previously-failed tests **first** |
+| `-k "pattern"` | Run only tests whose name matches `pattern` |
+| `--tb=long` | Full traceback plus local variables |
+| `--durations=10` | The 10 slowest tests — useful for finding a slow suite |
+| `-p no:cacheprovider` | Do not write `.pytest_cache/` |
+
+**Reading the exit code** — this is what CI and `scripts/validate.sh`
+actually use:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Every selected test passed |
+| `1` | At least one test failed |
+| `2` | Interrupted (Ctrl-C) |
+| `5` | No tests were collected — usually a wrong path or a bad `-k` filter |
+
+```bash
+pytest -q tests/ -m integration
+echo "exit code: $?"     # 0 = green
+```
+
+**A green run still has to mean something.** A suite that silently
+collects nothing exits `0` and looks like a pass. Always check the
+counts, not just the exit code:
+
+```bash
+pytest tests/ -m integration --collect-only | grep collected
+# 45/85 tests collected (40 deselected) in 0.37s
+```
+
+If that says `0 tests collected`, the suite did not run — the marker
+filter, the path, or the `pytest.ini` is wrong. Note that `-q` changes
+the wording (`tests/integration/test_api.py: 45` instead of
+`45/85 tests collected`), and that `--collect-only -q | tail -1`
+prints the pytest documentation URL rather than the count, because the
+warnings summary is the last thing on stdout.
+
+### Running the suites
+
+**Unit suite — no database needed:**
+
+```bash
+cd apps/python-api
+
+# Create a virtualenv (pick one)
+python3.11 -m venv .venv && source .venv/bin/activate
+# ...or, with uv (faster):
+#   uv venv --python 3.11 .venv && source .venv/bin/activate
+
+pip install -r requirements.txt
+pip install pytest httpx
+
+# The API validates its settings at import time, so these two must be set.
+export JWT_SECRET=$(openssl rand -hex 32)
+export ANON_SALT=$(openssl rand -hex 32)
+
+pytest -q tests/                 # 40 unit tests
+pytest -v tests/                 # ...with the name of each test
+pytest tests/test_security.py -v # ...one file
+pytest -k "password" -v          # ...one topic
+```
+
+Expected: `40 passed, 45 deselected, 1 warning in 0.79s`.
+
+> Run pytest **from `apps/python-api/`**. `pytest.ini` sets
+> `pythonpath = .` so the `app` package resolves relative to that
+> directory. Running from the repo root finds no `pytest.ini` and the
+> imports fail.
+
+**Integration suite — needs PostgreSQL:**
+
+```bash
+# 1. Start a throwaway database
+docker run -d --name test-pg -p 5432:5432 \
+  -e POSTGRES_USER=shop -e POSTGRES_PASSWORD=shop -e POSTGRES_DB=shopdb \
+  pgvector/pgvector:pg16
+
+# 2. Wait for it to accept connections
+until docker exec test-pg pg_isready -U shop -d shopdb >/dev/null 2>&1; do
+  sleep 1
+done
+
+# 3. Point the suite at it and run
+cd apps/python-api
+export DATABASE_URL="postgresql+psycopg://shop:shop@127.0.0.1:5432/shopdb"
+export JWT_SECRET=$(openssl rand -hex 32)
+export ANON_SALT=$(openssl rand -hex 32)
+pytest -q tests/ -m integration   # 45 integration tests
+
+# 4. Clean up
+docker rm -f test-pg
+```
+
+Expected: `45 passed, 40 deselected, 1 warning`.
+
+**Everything at once**, exactly as `scripts/validate.sh` does it —
+a throwaway database on a random high port, removed afterwards:
+
+```bash
+bash scripts/validate.sh
+```
+
+### Debugging a failing test
+
+```bash
+# 1. See which test failed
+pytest -q tests/ -m integration
+
+# 2. Re-run only that one, with full detail.
+#    `-m integration` is REQUIRED even for a single test: the default
+#    marker filter in pytest.ini would otherwise deselect it and you
+#    would see "1 deselected" instead of a result.
+pytest "tests/integration/test_api.py::TestContent::test_draft_is_not_publicly_readable" \
+  -m integration -l
+
+# 3. Drop into the debugger at the failure
+pytest "tests/integration/test_api.py::TestContent::test_draft_is_not_publicly_readable" \
+  -m integration --pdb
+#    (pdb) > response
+#    (pdb) > response.status_code
+#    (pdb) > response.text
+
+# 4. Print the captured logs for the failing test
+pytest -q tests/ -m integration --log-cli-level=INFO
+```
+
+> **The `-m` flag is not optional for integration tests.** `pytest.ini`
+> sets `addopts = -m "not integration"`, and that filter applies to
+> explicit node IDs too. Without `-m integration`, pytest reports
+> `1 deselected` and exits `0` — a green run that tested nothing.
+
+**Integration tests need the schema to be creatable.** The fixture drops
+and recreates every table before each test. If a test errors with
+`UndefinedTable` or `relation "content" does not exist`, the schema was
+not created — check that `DATABASE_URL` points at a reachable Postgres
+and that the `pgvector` image (not plain `postgres`) is in use.
+
 ### CI
 
 `.github/workflows/validate.yml` runs the full validation, the Python unit
@@ -669,7 +1410,7 @@ regression in auth or authorisation fails the build.
 
 ---
 
-## 11. Monitoring
+## 12. Monitoring
 
 ### What is collected
 
@@ -719,7 +1460,7 @@ single dashboard query works across all three API services:
 
 ---
 
-## 12. Backup & restore
+## 13. Backup & restore
 
 ### Schedule
 
@@ -778,7 +1519,7 @@ export OBJECT_STORE_BACKUP_CMD="mc mirror --overwrite myminio/bucket /tmp/obj &&
 
 ---
 
-## 13. Security model
+## 14. Security model
 
 ### Controls in place
 
@@ -852,7 +1593,7 @@ sudo systemctl restart python-api
 
 ---
 
-## 14. Cloud deployment (AWS / GCP)
+## 15. Cloud deployment (AWS / GCP)
 
 ### AWS (EC2 + S3)
 
@@ -870,7 +1611,7 @@ aws s3 mb s3://my-webshop-media
 Set `DATABASE_URL` to an **RDS** endpoint. The app currently creates its
 schema with SQLAlchemy's `create_all()` on startup, so pointing it at RDS
 works out of the box — but it is not a migration story. Adopt Alembic before
-the first schema change (see [Known limitations](#15-known-limitations)):
+the first schema change (see [Known limitations](#16-known-limitations)):
 
 ```bash
 # RDS
@@ -917,7 +1658,7 @@ that the main file includes with `include:`).
 
 ---
 
-## 15. Known limitations
+## 16. Known limitations
 
 Honest list of what is **not** production-ready yet:
 
@@ -962,7 +1703,7 @@ ready but not yet populated.
 
 ---
 
-## 16. Roadmap
+## 17. Roadmap
 
 ### Near term (blocks production launch)
 
