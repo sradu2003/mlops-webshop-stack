@@ -1,0 +1,273 @@
+# =============================================================================
+# mlops-webshop-stack — Docker services
+# =============================================================================
+# All host-published ports bind to 127.0.0.1. Traffic reaches them only
+# through the nginx reverse proxy. Never publish on 0.0.0.0.
+#
+# Start:  docker compose up -d        (from this directory)
+# Override for local dev: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# =============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-mlops-webshop}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ---------------------------------------------------------------------------
+  # AI layer
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:${OLLAMA_TAG:-latest}
+    container_name: ollama
+    restart: unless-stopped
+    mem_limit: ${OLLAMA_MEMORY_LIMIT:-1800m}
+    logging: *default-logging
+    environment:
+      # Keep the model resident; avoids reloading on every request.
+      OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-5m}"
+      OLLAMA_HOST: "0.0.0.0:11434"
+      # Do not phone home for model updates on a metered/egress-limited VPS.
+      OLLAMA_NO_CLOUD: "1"
+    ports:
+      - "127.0.0.1:${OLLAMA_HOST_PORT:-11434}:11434"
+    volumes:
+      - ollama:/root/.ollama
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${OPEN_WEBUI_TAG:-main}
+    container_name: open-webui
+    restart: unless-stopped
+    mem_limit: ${OPEN_WEBUI_MEMORY_LIMIT:-1200m}
+    logging: *default-logging
+    environment:
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      WEBUI_AUTH: "true"
+      # Persist conversations in the Postgres instance instead of SQLite so
+      # the data is covered by the same backup/restore path as everything else.
+      DATABASE_TYPE: "postgres"
+      DATABASE_URL: "postgresql://${LISTMONK_DB_USER:-shop}:${LISTMONK_DB_PASSWORD}@listmonk-db:5432/${OPEN_WEBUI_DB_NAME:-openwebui}"
+      # Do not phone home.
+      DO_NOT_TRACK: "true"
+      # Vector store for the RAG feature. 'pgvector' reuses the Postgres
+      # instance that is already running — no extra service, no extra RAM.
+      # Valid values: pgvector | chroma | qdrant | milvus | valkey | ...
+      VECTOR_DB: "${OPEN_WEBUI_VECTOR_DB:-pgvector}"
+      ENABLE_OLLAMA_API: "true"
+    ports:
+      - "127.0.0.1:${OPEN_WEBUI_HOST_PORT:-8085}:8080"
+    volumes:
+      - open-webui:/app/backend/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+      listmonk-db:
+        condition: service_healthy
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  # ---------------------------------------------------------------------------
+  # Datastores
+  # ---------------------------------------------------------------------------
+  listmonk-db:
+    # pgvector/pgvector is the postgres image WITH the vector extension.
+    # The plain `postgres:16-alpine` image does NOT ship it, and Open WebUI's
+    # RAG feature (VECTOR_DB=pgvector) fails to start without it.
+    image: pgvector/pgvector:${POSTGRES_TAG:-pg16}
+    container_name: listmonk-db
+    restart: unless-stopped
+    mem_limit: 400m
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${LISTMONK_DB_USER:-shop}
+      POSTGRES_PASSWORD: ${LISTMONK_DB_PASSWORD:-change_me_listmonk_password}
+      POSTGRES_DB: ${LISTMONK_DB_NAME:-shopdb}
+      # scram-sha-256 instead of the (insecure) default md5.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - listmonk-db:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LISTMONK_DB_USER:-shop} -d ${LISTMONK_DB_NAME:-shopdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  listmonk:
+    image: listmonk/listmonk:${LISTMONK_TAG:-latest}
+    container_name: listmonk
+    restart: unless-stopped
+    mem_limit: 300m
+    logging: *default-logging
+    depends_on:
+      listmonk-db:
+        condition: service_healthy
+      listmonk-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${LISTMONK_HOST_PORT:-9000}:9000"
+    environment:
+      LISTMONK_app__address: "0.0.0.0:9000"
+      LISTMONK_db__host: listmonk-db
+      LISTMONK_db__port: "5432"
+      LISTMONK_db__user: ${LISTMONK_DB_USER:-shop}
+      LISTMONK_db__password: ${LISTMONK_DB_PASSWORD:-change_me_listmonk_password}
+      LISTMONK_db__database: ${LISTMONK_DB_NAME:-shopdb}
+      LISTMONK_db__ssl_mode: disable
+      LISTMONK_db__max_open: 20
+      LISTMONK_db__max_idle: 5
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # One-shot initialisation
+  # ---------------------------------------------------------------------------
+  # listmonk ships with an empty database schema. Without this step the
+  # `listmonk` container crash-loops forever with:
+  #   the database does not appear to be setup. Run --install.
+  # `yes |` answers listmonk's interactive "continue (y/N)?" prompt.
+  # The command is idempotent: on an already-initialised database listmonk
+  # reports success without touching the data.
+  listmonk-init:
+    image: listmonk/listmonk:${LISTMONK_TAG:-latest}
+    container_name: listmonk-init
+    restart: "no"
+    mem_limit: 300m
+    logging: *default-logging
+    depends_on:
+      listmonk-db:
+        condition: service_healthy
+    environment:
+      LISTMONK_app__address: "0.0.0.0:9000"
+      LISTMONK_db__host: listmonk-db
+      LISTMONK_db__port: "5432"
+      LISTMONK_db__user: ${LISTMONK_DB_USER:-shop}
+      LISTMONK_db__password: ${LISTMONK_DB_PASSWORD:-change_me_listmonk_password}
+      LISTMONK_db__database: ${LISTMONK_DB_NAME:-shopdb}
+      LISTMONK_db__ssl_mode: disable
+    entrypoint: ["sh", "-c", "yes | ./listmonk --install"]
+    networks: [backend]
+
+  # ---------------------------------------------------------------------------
+  # Observability
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_TAG:-latest}
+    container_name: prometheus
+    restart: unless-stopped
+    mem_limit: 400m
+    logging: *default-logging
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}"
+      - "--storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-2GB}"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9091}:9090"
+    networks: [backend]
+    extra_hosts:
+      # host.docker.internal is NOT resolved on Linux by default. This makes
+      # the host-side services (FastAPI on :3000, node_exporter on :9100)
+      # reachable from inside the container network.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/healthy >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  node-exporter:
+    image: prom/node-exporter:${NODE_EXPORTER_TAG:-latest}
+    container_name: node-exporter
+    restart: unless-stopped
+    mem_limit: 150m
+    logging: *default-logging
+    command:
+      - "--path.rootfs=/host"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      # `rslave` is required on Linux for node-exporter to see host mounts
+      # correctly. Docker Desktop (macOS) rejects it with
+      #   "path / is mounted on / but it is not a shared or slave mount"
+      # so the dev override drops the propagation mode.
+      - /:/host:ro,rslave
+    pid: host
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9100/metrics >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  grafana:
+    image: grafana/grafana-oss:${GRAFANA_TAG:-latest}
+    container_name: grafana
+    restart: unless-stopped
+    mem_limit: 400m
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change_me_grafana_password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-https://grafana.xxx.com}
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_COOKIE_SAMESITE: "strict"
+      GF_SECURITY_STRICT_TRANSPORT_SECURITY: "true"
+      GF_SECURITY_CONTENT_SECURITY_POLICY: "true"
+    ports:
+      - "127.0.0.1:${GRAFANA_HOST_PORT:-3030}:3000"
+    volumes:
+      - grafana:/var/lib/grafana
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+
+volumes:
+  open-webui:
+  ollama:
+  listmonk-db:
+  prometheus:
+  grafana:
+
+networks:
+  backend:
+    driver: bridge

@@ -1,0 +1,30 @@
+[Unit]
+Description=Streamlit Data App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/apps/streamlit-app
+EnvironmentFile=/opt/apps/streamlit-app/.env
+ExecStart=/opt/apps/streamlit-app/.venv/bin/streamlit run app.py \
+    --server.address 127.0.0.1 \
+    --server.port 3001 \
+    --server.headless true \
+    --server.enableCORS false \
+    --server.enableXsrfProtection true \
+    --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=5
+MemoryMax=500M
+CPUQuota=100%
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/apps/streamlit-app
+
+[Install]
+WantedBy=multi-user.target

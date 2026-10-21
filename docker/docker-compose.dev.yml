@@ -1,0 +1,52 @@
+# =============================================================================
+# Local development override (macOS / Docker Desktop)
+# =============================================================================
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Differences from the production compose file:
+#   * Ollama is published on 11435 because the macOS host usually already
+#     runs a native Ollama on 11434.
+#   * Resource limits are relaxed a little for a 128 GB development machine.
+#   * Grafana/Prometheus logs are more verbose.
+#   * node-exporter drops the `rslave` mount propagation, which Docker
+#     Desktop rejects on macOS.
+# =============================================================================
+
+services:
+  ollama:
+    ports: !override
+      - "127.0.0.1:11435:11434"
+    mem_limit: 8g
+
+  open-webui:
+    mem_limit: 4g
+    environment:
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      # Keep the native (host) Ollama reachable too.
+      ENABLE_OLLAMA_API: "true"
+      OLLAMA_API_BASE_URL: "http://host.docker.internal:11434"
+
+  listmonk:
+    mem_limit: 1g
+
+  grafana:
+    mem_limit: 1g
+
+  prometheus:
+    mem_limit: 1g
+    # NOTE: the retention-size flag is kept from the base file. Dropping it
+    # silently changed the on-disk limit between dev and production.
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+      - "--storage.tsdb.retention.size=2GB"
+      - "--web.enable-lifecycle"
+      - "--log.level=debug"
+
+  # Docker Desktop (macOS) cannot use the `rslave` propagation mode:
+  #   "path / is mounted on / but it is not a shared or slave mount"
+  # The volume is therefore remounted without it.
+  node-exporter:
+    volumes: !override
+      - /:/host:ro

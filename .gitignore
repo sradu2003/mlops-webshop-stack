@@ -1,0 +1,56 @@
+# ---- Secrets (NEVER commit) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+/secrets/
+/certs/
+
+# ---- Local data / volumes ----
+docker/.env
+data/
+/var/
+/opt/apps/
+/opt/jupyter/
+*.sqlite
+*.db
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ---- Node ----
+node_modules/
+.next/
+out/
+dist/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# ---- Model artifacts ----
+*.gguf
+*.safetensors
+*.bin
+models/
+
+# ---- Backups ----
+/backups/
+*.tar.gz
+*.sql.gz
+
+# ---- Editors / OS ----
+.idea/
+.vscode/
+*.swp
+.DS_Store

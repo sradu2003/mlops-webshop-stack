@@ -1,0 +1,17 @@
+{
+  "name": "node-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "cors": "^2.8.5",
+    "morgan": "^1.10.0",
+    "@prometheus-io/client": "^0.16.1"
+  }
+}

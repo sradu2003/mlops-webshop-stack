@@ -1,0 +1,39 @@
+[Unit]
+Description=JupyterLab (data/notebook workspace)
+Documentation=man:notebook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jupyter
+Group=jupyter
+WorkingDirectory=/home/jupyter
+EnvironmentFile=-/opt/jupyter/.env
+# The token is supplied via /opt/jupyter/.env (JUPYTER_TOKEN). It MUST be set:
+# an unauthenticated JupyterLab exposed through the reverse proxy is a
+# remote-code-execution hole.
+ExecStart=/opt/jupyter/.venv/bin/jupyter lab \
+    --ip=127.0.0.1 \
+    --port=8888 \
+    --no-browser \
+    --ServerApp.base_url=/ \
+    --ServerApp.allow_origin= \
+    --ServerApp.disable_check_xsrf=False \
+    --ServerApp.trust_xheaders=True \
+    --ServerApp.root_dir=/home/jupyter
+Restart=on-failure
+RestartSec=5
+# Notebook kernels can balloon; cap them and let the OOM killer act.
+MemoryMax=800M
+MemoryHigh=600M
+CPUQuota=150%
+TasksMax=256
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/jupyter
+
+[Install]
+WantedBy=multi-user.target

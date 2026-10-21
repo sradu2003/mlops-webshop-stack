@@ -1,0 +1,28 @@
+[Unit]
+Description=Next.js RAG service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/apps/nextjs-rag
+EnvironmentFile=/opt/apps/nextjs-rag/.env
+Environment=NODE_ENV=production
+# `next start` is the supported entrypoint for the default (non-standalone)
+# build output. Do NOT set output:"standalone" in next.config.js while this
+# unit runs `npm run start`, or Next.js refuses to serve.
+ExecStart=/usr/bin/npm run start -- -p 8001 -H 127.0.0.1
+Restart=on-failure
+RestartSec=5
+MemoryMax=600M
+CPUQuota=100%
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/apps/nextjs-rag/.next
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,88 @@
+# =============================================================================
+# Prometheus scrape configuration
+# =============================================================================
+# Targets reachable over the compose `backend` network use the service name
+# (e.g. node-exporter:9100). Targets that run on the HOST (the systemd
+# services) use host.docker.internal, which the compose file maps to the host
+# gateway via `extra_hosts: host.docker.internal:host-gateway`.
+# =============================================================================
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    monitor: mlops-webshop-stack
+
+scrape_configs:
+  # --- Dockerised services (internal network) ---
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: node_exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          service: node-exporter
+
+  # NOTE: Ollama does not expose a Prometheus endpoint (verified against
+  # ollama 0.30.x). Its request latency and model-load time are instead
+  # observed indirectly through the nginx access logs and the Open WebUI
+  # /metrics endpoint. Do not add a scrape job for it — it would only
+  # produce a permanently `down` target.
+
+  # --- Host systemd services (via the docker host gateway) ---
+  - job_name: python_api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:3000"]
+        labels:
+          service: python-api
+
+  - job_name: node_api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+        labels:
+          service: node-api
+
+  - job_name: nextjs_rag
+    # The RAG service exposes its registry at /api/metrics, NOT /metrics.
+    # Scraping /metrics returned 404 and left this target permanently
+    # `down`, so the LLM latency series were never collected.
+    metrics_path: /api/metrics
+    static_configs:
+      - targets: ["host.docker.internal:8001"]
+        labels:
+          service: nextjs-rag
+
+  - job_name: streamlit
+    metrics_path: /_stcore/metrics
+    static_configs:
+      - targets: ["host.docker.internal:3001"]
+        labels:
+          service: streamlit
+
+  # NOTE: uptime probes of the public vhosts need a blackbox-exporter.
+  # It is intentionally NOT wired up here because it adds a container and
+  # ~50 MB of RAM for a target that nginx's access log already covers.
+  # If you want synthetic uptime checks, add prom/blackbox-exporter and a
+  # relabeling job that routes through it:
+  #
+  #   - job_name: blackbox
+  #     metrics_path: /probe
+  #     params:
+  #       module: [http_2xx]
+  #     static_configs:
+  #       - targets: ["https://api.example.com"]
+  #     relabel_configs:
+  #       - source_labels: [__address__]
+  #         target_label: __param_target
+  #       - source_labels: [__param_target]
+  #         target_label: instance
+  #       - target_label: __address__
+  #         replacement: blackbox-exporter:9115
+
+# Recording rules: convert raw counters into the dashboards' inputs.
+rule_files:
+  - /etc/prometheus/rules/*.yml

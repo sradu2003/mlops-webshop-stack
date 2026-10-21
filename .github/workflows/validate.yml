@@ -1,0 +1,154 @@
+name: validate
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validation tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          pip install yamllint
+
+      - name: Run full validation
+        run: bash scripts/validate.sh
+
+      - name: Build compose images
+        run: docker compose -f docker/docker-compose.yml config --quiet
+        working-directory: .
+        env:
+          COMPOSE_PROJECT_NAME: ci
+
+  python:
+    name: Python API tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/python-api
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: shop
+          POSTGRES_PASSWORD: shop
+          POSTGRES_DB: shopdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U shop"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx
+
+      - name: Run unit tests
+        # The default marker filter is `not integration`, so this needs no
+        # database. The pgvector service is still started for the next step.
+        run: pytest -q tests/
+        env:
+          JWT_SECRET: ci-test-secret-0123456789abcdef
+          ANON_SALT: ci-test-anon-salt-0123456789abcdef
+
+      - name: Run integration tests
+        # The integration suite exercises the real HTTP surface against the
+        # real database. It is a HARD gate: a regression in auth,
+        # authorisation or the content lifecycle must fail the build.
+        run: pytest -q tests/ -m integration
+        env:
+          JWT_SECRET: ci-test-secret-0123456789abcdef
+          ANON_SALT: ci-test-anon-salt-0123456789abcdef
+          DATABASE_URL: postgresql+psycopg://shop:shop@127.0.0.1:5432/shopdb
+
+  node:
+    name: Node apps
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/node-api
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: node-api install
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: node-api smoke test
+        run: |
+          node -e "
+            const http = require('http');
+            // Verify the module loads and the metrics registry is registered.
+            import('./server.js').then(() => {
+              setTimeout(() => {
+                http.get('http://127.0.0.1:8000/metrics', (res) => {
+                  let body = '';
+                  res.on('data', (d) => (body += d));
+                  res.on('end', () => {
+                    if (!body.includes('node_api_http_requests_total')) {
+                      console.error('metrics missing');
+                      process.exit(1);
+                    }
+                    console.log('metrics OK');
+                    process.exit(0);
+                  });
+                }).on('error', (e) => { console.error(e.message); process.exit(1); });
+              }, 1500);
+            }).catch((e) => { console.error(e); process.exit(1); });
+          "
+
+  nextjs:
+    name: Next.js RAG
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/nextjs-rag
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Audit
+        run: npm audit --audit-level=high || true

@@ -1,0 +1,162 @@
+# Recording rules for the webshop stack.
+# These pre-compute the queries the Grafana dashboards need, so the
+# dashboards stay fast and the query logic lives in version control.
+#
+# ---------------------------------------------------------------------------
+# WHY THE `or` OPERATORS
+# ---------------------------------------------------------------------------
+# Each service exports a DIFFERENT metric family, because each uses a
+# different client library:
+#
+#   python-api  -> http_requests_total, http_request_duration_seconds_bucket
+#   node-api    -> node_api_http_requests_total, node_api_http_request_duration_seconds_bucket
+#   nextjs-rag  -> rag_http_requests_total, rag_http_request_duration_seconds_bucket
+#
+# A single `rate(http_requests_total{...})` therefore only ever matched the
+# FastAPI service: the node-api and nextjs-rag series were silently absent
+# from every dashboard, and the "per-service" panels showed one service.
+#
+# The `or` operator unions vectors that carry different `job` labels, so
+# each family is summed into one normalised recording rule that a dashboard
+# can query once.
+#
+# Label names also differ:
+#   python-api  -> `status`     (grouped to 2xx/4xx/5xx)
+#   node-api    -> `status_code`
+#   nextjs-rag  -> `status_code`
+# ---------------------------------------------------------------------------
+
+groups:
+  - name: webshop-api
+    interval: 30s
+    rules:
+      # --- Request rate per service ---
+      - record: service:http_requests:rate5m
+        expr: |
+          sum by (service, job) (
+            rate(http_requests_total{job="python_api"}[5m])
+            or
+            rate(node_api_http_requests_total{job="node_api"}[5m])
+            or
+            rate(rag_http_requests_total{job="nextjs_rag"}[5m])
+          )
+
+      # --- Error ratio (5xx) per service ---
+      # The denominator is clamped at 0.001 so an idle service yields 0
+      # instead of a NaN that blanks the whole panel.
+      - record: service:http_error_ratio:rate5m
+        expr: |
+          (
+            sum by (service, job) (
+              rate(http_requests_total{job="python_api", status=~"5.."}[5m])
+            )
+            or
+            sum by (service, job) (
+              rate(node_api_http_requests_total{job="node_api", status_code=~"5.."}[5m])
+            )
+            or
+            sum by (service, job) (
+              rate(rag_http_requests_total{job="nextjs_rag", status_code=~"5.."}[5m])
+            )
+          )
+          /
+          clamp_min(
+            sum by (service, job) (
+              rate(http_requests_total{job="python_api"}[5m])
+              or
+              rate(node_api_http_requests_total{job="node_api"}[5m])
+              or
+              rate(rag_http_requests_total{job="nextjs_rag"}[5m])
+            ), 0.001
+          )
+
+      # --- p95 latency per service ---
+      - record: service:http_request_duration_seconds:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (service, job, le) (
+              rate(http_request_duration_seconds_bucket{job="python_api"}[5m])
+              or
+              rate(node_api_http_request_duration_seconds_bucket{job="node_api"}[5m])
+              or
+              rate(rag_http_request_duration_seconds_bucket{job="nextjs_rag"}[5m])
+            )
+          )
+
+      # --- In-flight requests ---
+      # `http_requests_inprogress` is the name prometheus-fastapi-instrumentator
+      # uses. The previous rule referenced `http_requests_in_progress`, which
+      # no client library ever exports, so the rule always returned an empty
+      # vector.
+      - record: service:http_requests_in_flight
+        expr: |
+          sum by (service, job) (http_requests_inprogress)
+
+  - name: webshop-llm
+    interval: 30s
+    rules:
+      # NOTE: Ollama exposes no Prometheus endpoint, so there are no
+      # ollama_* series to record here. LLM latency is observed through
+      # the RAG service's own `rag_ollama_request_duration_seconds` metric.
+      #
+      # The previous rule used `http_request_duration_seconds_bucket` with
+      # job="nextjs_rag", but the RAG service never exports that family —
+      # it exports `rag_http_request_duration_seconds_bucket`. The rule
+      # therefore produced nothing.
+      - record: llm:upstream_request_duration_seconds:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(rag_ollama_request_duration_seconds_bucket{job="nextjs_rag"}[5m])
+            )
+          )
+
+      # --- LLM upstream request rate and error ratio ---
+      - record: llm:upstream_requests:rate5m
+        expr: |
+          sum by (status) (
+            rate(rag_ollama_requests_total{job="nextjs_rag"}[5m])
+          )
+
+      # Total upstream errors divided by TOTAL upstream requests.
+      #
+      # The denominator is deliberately NOT grouped by `status`: dividing a
+      # per-status numerator by a per-status denominator yields
+      # error_rate/error_rate == 1 for the error series, which is
+      # meaningless. Both sides must be scalar sums.
+      - record: llm:upstream_error_ratio:rate5m
+        expr: |
+          sum(
+            rate(rag_ollama_requests_total{job="nextjs_rag", status="error"}[5m])
+          )
+          /
+          clamp_min(
+            sum(
+              rate(rag_ollama_requests_total{job="nextjs_rag"}[5m])
+            ), 0.001
+          )
+
+  - name: webshop-host
+    interval: 30s
+    rules:
+      # --- Host memory used (excluding cache/buffers) ---
+      - record: host:memory_used_bytes
+        expr: |
+          node_memory_MemTotal_bytes
+          - node_memory_MemAvailable_bytes
+
+      # --- Host memory utilisation ratio ---
+      - record: host:memory_utilisation:ratio
+        expr: |
+          1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+      # --- Host disk usage on the root filesystem ---
+      - record: host:disk_used_ratio:root
+        expr: |
+          1 - (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}
+          )

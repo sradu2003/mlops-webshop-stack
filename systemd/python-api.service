@@ -1,0 +1,37 @@
+[Unit]
+Description=Shop API (FastAPI)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/apps/python-api
+EnvironmentFile=/opt/apps/python-api/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Gunicorn with an explicit worker class. `--workers 2` under uvicorn without
+# `--loop`/`--http` leaves the proxy headers unhandled.
+ExecStart=/opt/apps/python-api/.venv/bin/gunicorn app.main:app \
+    --bind 127.0.0.1:3000 \
+    --workers 2 \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --timeout 60 \
+    --graceful-timeout 30 \
+    --keep-alive 5 \
+    --access-logfile - \
+    --error-logfile -
+Restart=on-failure
+RestartSec=5
+MemoryMax=700M
+CPUQuota=150%
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/apps/python-api
+
+[Install]
+WantedBy=multi-user.target

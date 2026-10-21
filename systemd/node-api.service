@@ -1,0 +1,27 @@
+[Unit]
+Description=Node.js REST API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/apps/node-api
+EnvironmentFile=/opt/apps/node-api/.env
+Environment=NODE_ENV=production
+Environment=PORT=8000
+Environment=HOST=127.0.0.1
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+MemoryMax=400M
+CPUQuota=100%
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/apps/node-api
+
+[Install]
+WantedBy=multi-user.target

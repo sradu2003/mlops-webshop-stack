@@ -1,0 +1,6 @@
+[Unit]
+Description=Renew Let's Encrypt wildcard cert and sync to /etc/ssl/shared
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ssl-renew.sh
